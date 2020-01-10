@@ -16,7 +16,7 @@ const NUMERIC_UNIT_FORMATS = {
       .startOf("hour"),
   "day-of-week": value =>
     moment()
-      .day(value - 1)
+      .isoWeekday(value)
       .startOf("day"),
   "day-of-month": value =>
     moment("2016-01-01") // initial date must be in month with 31 days to format properly

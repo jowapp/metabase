@@ -189,12 +189,11 @@
           :hour            (stringify "%Y-%m-%dT%H:00:00")
           :hour-of-day     {$hour column}
           :day             (stringify "%Y-%m-%d")
-          :day-of-week     {$dayOfWeek column}
+          :day-of-week     {$add [{$mod [{$add [{$dayOfWeek column} 5]} 7]} 1]}
           :day-of-month    {$dayOfMonth column}
           :day-of-year     {$dayOfYear column}
           :week            (stringify "%Y-%m-%d" {$subtract [column
-                                                             {$multiply [{$subtract [{$dayOfWeek column}
-                                                                                     1]}
+                                                             {$multiply [ {$mod [{$add [{$dayOfWeek column} 5]}
                                                                          (* 24 60 60 1000)]}]})
           :week-of-year    {$add [{$week column}
                                   1]}
