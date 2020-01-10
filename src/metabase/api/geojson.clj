@@ -6,7 +6,7 @@
             [metabase.models.setting :as setting :refer [defsetting]]
             [metabase.util :as u]
             [metabase.util
-             [i18n :as ui18n :refer [tru]]
+             [i18n :as ui18n :refer [deferred-tru tru]]
              [schema :as su]]
             [ring.util.response :as rr]
             [schema.core :as s])
@@ -54,7 +54,7 @@
             (valid-json? resource)
             (catch JsonParseException e
               (rethrow-with-message (tru "Unable to parse resource `{0}` as JSON" relative-path-with-prefix) e)))
-          (throw (FileNotFoundException. (str (tru "Unable to find JSON via relative path `{0}`" relative-path-with-prefix)))))))))
+          (throw (FileNotFoundException. (tru "Unable to find JSON via relative path `{0}`" relative-path-with-prefix))))))))
 
 (defn- valid-json-url?
   "Is URL a valid HTTP URL and does it point to valid JSON?"
@@ -85,7 +85,7 @@
   (memoize (fn [url-or-resource-path]
              (or (valid-json-url? url-or-resource-path)
                  (valid-json-resource? url-or-resource-path)
-                 (throw (Exception. (str (tru "Invalid JSON URL or resource: {0}" url-or-resource-path))))))))
+                 (throw (Exception. (tru "Invalid JSON URL or resource: {0}" url-or-resource-path)))))))
 
 (def ^:private CustomGeoJSON
   {s/Keyword {:name                     s/Str
@@ -97,8 +97,8 @@
 (def ^:private ^:const builtin-geojson
   {:us_states       {:name        "United States"
                      :url         "app/assets/geojson/us-states.json"
-                     :region_key  "name"
-                     :region_name "name"
+                     :region_key  "STATE"
+                     :region_name "NAME"
                      :builtin     true}
    :world_countries {:name        "World"
                      :url         "app/assets/geojson/world.json"
@@ -112,14 +112,15 @@
     (valid-json-url-or-resource? geo-url-or-uri)))
 
 (defsetting custom-geojson
-  (tru "JSON containing information about custom GeoJSON files for use in map visualizations instead of the default US State or World GeoJSON.")
+  (deferred-tru "JSON containing information about custom GeoJSON files for use in map visualizations instead of the default US State or World GeoJSON.")
   :type    :json
   :default {}
   :getter  (fn [] (merge (setting/get-json :custom-geojson) builtin-geojson))
   :setter  (fn [new-value]
              (when new-value
                (validate-custom-geo-json new-value))
-             (setting/set-json! :custom-geojson new-value)))
+             (setting/set-json! :custom-geojson new-value))
+  :visibility :public)
 
 
 (defendpoint GET "/:key"
@@ -128,7 +129,7 @@
   [key]
   {key su/NonBlankString}
   (let [url (or (get-in (custom-geojson) [(keyword key) :url])
-                (throw (ui18n/ex-info (tru "Invalid custom GeoJSON key: {0}" key)
+                (throw (ex-info (tru "Invalid custom GeoJSON key: {0}" key)
                          {:status-code 400})))]
     ;; TODO - it would be nice if we could also avoid returning our usual cache-busting headers with the response here
     (-> (rr/response (ReaderInputStream. (io/reader url)))

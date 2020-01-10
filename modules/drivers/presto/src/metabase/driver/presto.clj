@@ -1,10 +1,6 @@
 (ns metabase.driver.presto
   "Presto driver. See https://prestodb.io/docs/current/ for complete dox."
   (:require [clj-http.client :as http]
-            [clj-time
-             [coerce :as tcoerce]
-             [core :as time]
-             [format :as tformat]]
             [clojure
              [set :as set]
              [string :as str]]
@@ -12,24 +8,28 @@
             [honeysql
              [core :as hsql]
              [helpers :as h]]
+            [java-time :as t]
             [metabase
-             [config :as config]
              [driver :as driver]
              [util :as u]]
             [metabase.driver.common :as driver.common]
-            [metabase.driver.sql.query-processor :as sql.qp]
+            [metabase.driver.sql
+             [query-processor :as sql.qp]
+             [util :as sql.u]]
             [metabase.driver.sql.util.unprepare :as unprepare]
             [metabase.query-processor
              [store :as qp.store]
+             [timezone :as qp.timezone]
              [util :as qputil]]
             [metabase.util
-             [date :as du]
+             [date-2 :as u.date]
              [honeysql-extensions :as hx]
+             [i18n :refer [trs tru]]
              [schema :as su]
              [ssh :as ssh]]
             [schema.core :as s])
   (:import java.sql.Time
-           java.util.Date))
+           [java.time OffsetDateTime ZonedDateTime]))
 
 (driver/register! :presto, :parent :sql)
 
@@ -46,80 +46,63 @@
   (str (if ssl "https" "http") "://" host ":" port
        path))
 
-(defn- details->request [{:keys [user password catalog report-timezone]}]
+(defn- details->request [{:keys [user password catalog]}]
   (merge {:headers (merge {"X-Presto-Source" "metabase"
                            "X-Presto-User"   user}
                           (when catalog
                             {"X-Presto-Catalog" catalog})
-                          (when report-timezone
+                          (when-let [report-timezone (qp.timezone/report-timezone-id-if-supported)]
                             {"X-Presto-Time-Zone" report-timezone}))}
          (when password
            {:basic-auth [user password]})))
 
-(defn- parse-time-with-tz [s]
-  ;; Try parsing with offset first then with full ZoneId
-  (or (u/ignore-exceptions (du/parse-date "HH:mm:ss.SSS ZZ" s))
-      (du/parse-date "HH:mm:ss.SSS ZZZ" s)))
+(defn ^:private create-cancel-url [cancel-uri host port info-uri]
+  ;; Replace the host in the cancel-uri with the host from the info-uri provided from the presto response- this doesn't
+  ;; break SSH tunneling as the host in the cancel-uri is different if it's enabled
+  (str/replace cancel-uri (str host ":" port) (get (str/split info-uri #"/") 2)))
 
-(defn- parse-timestamp-with-tz [s]
-  ;; Try parsing with offset first then with full ZoneId
-  (or (u/ignore-exceptions (du/parse-date "yyyy-MM-dd HH:mm:ss.SSS ZZ" s))
-      (du/parse-date "yyyy-MM-dd HH:mm:ss.SSS ZZZ" s)))
-
-(def ^:private presto-date-time-formatter
-  (du/->DateTimeFormatter "yyyy-MM-dd HH:mm:ss.SSS"))
-
-(defn- parse-presto-time
-  "Parsing time from presto using a specific formatter rather than the
-  utility functions as this will be called on each row returned, so
-  performance is important"
-  [time-str]
-  (->> time-str
-       (du/parse-date :hour-minute-second-ms)
-       tcoerce/to-long
-       Time.))
-
-(defn- field-type->parser [report-timezone field-type]
+(defn- field-type->parser [field-type]
   (condp re-matches field-type
     #"decimal.*"                bigdec
-    #"time"                     parse-presto-time
-    #"time with time zone"      parse-time-with-tz
-    #"timestamp"                (partial du/parse-date
-                                         (if-let [report-tz (and report-timezone
-                                                                 (time/time-zone-for-id report-timezone))]
-                                           (tformat/with-zone presto-date-time-formatter report-tz)
-                                           presto-date-time-formatter))
-    #"timestamp with time zone" parse-timestamp-with-tz
+    #"time"                     #(u.date/parse % (qp.timezone/results-timezone-id))
+    #"time with time zone"      #(u.date/parse % (qp.timezone/results-timezone-id))
+    #"timestamp"                #(u.date/parse % (qp.timezone/results-timezone-id))
+    #"timestamp with time zone" #(u.date/parse % (qp.timezone/results-timezone-id))
     #".*"                       identity))
 
-(defn- parse-presto-results [report-timezone columns data]
-  (let [parsers (map (comp #(field-type->parser report-timezone %) :type) columns)]
+(defn- parse-presto-results [columns data]
+  (let [parsers (map (comp field-type->parser :type) columns)]
     (for [row data]
       (vec
        (for [[value parser] (partition 2 (interleave row parsers))]
-         (when (some? value)
-           (parser value)))))))
+         (u/prog1 (when (some? value)
+                    (parser value))
+           (log/tracef "Parse %s -> %s" (pr-str value) (pr-str <>))))))))
 
 (defn- fetch-presto-results! [details {prev-columns :columns, prev-rows :rows} uri]
   (let [{{:keys [columns data nextUri error]} :body} (http/get uri (assoc (details->request details) :as :json))]
     (when error
-      (throw (ex-info (or (:message error) "Error running query.") error)))
-    (let [rows    (parse-presto-results (:report-timezone details) columns data)
+      (throw (ex-info (or (:message error) (tru "Error running query.")) error)))
+    (let [rows    (parse-presto-results columns data)
           results {:columns (or columns prev-columns)
                    :rows    (vec (concat prev-rows rows))}]
       (if (nil? nextUri)
         results
-        (do (Thread/sleep 100) ; Might not be the best way, but the pattern is that we poll Presto at intervals
+        (do (Thread/sleep 100)        ; Might not be the best way, but the pattern is that we poll Presto at intervals
             (fetch-presto-results! details results nextUri))))))
 
-(defn- execute-presto-query! [details query]
+(defn- execute-presto-query!
+  {:style/indent 1}
+  [details query]
   {:pre [(map? details)]}
   (ssh/with-ssh-tunnel [details-with-tunnel details]
-    (let [{{:keys [columns data nextUri error id]} :body} (http/post (details->uri details-with-tunnel "/v1/statement")
-                                                                     (assoc (details->request details-with-tunnel) :body query, :as :json))]
+    (let [{{:keys [columns data nextUri error id infoUri]} :body}
+          (http/post (details->uri details-with-tunnel "/v1/statement")
+                     (assoc (details->request details-with-tunnel)
+                             :body query, :as :json, :redirect-strategy :lax))]
       (when error
         (throw (ex-info (or (:message error) "Error preparing query.") error)))
-      (let [rows    (parse-presto-results (:report-timezone details) (or columns []) (or data []))
+      (let [rows    (parse-presto-results (or columns []) (or data []))
             results {:columns (or columns [])
                      :rows    rows}]
         (if (nil? nextUri)
@@ -131,48 +114,44 @@
             (try
               @results-future
               (catch InterruptedException e
-                (if id
-                  ;; If we have a query id, we can cancel the query
-                  (try
-                    (http/delete (details->uri details-with-tunnel (str "/v1/query/" id))
-                                 (details->request details-with-tunnel))
-                    ;; If we fail to cancel the query, log it but propogate the interrupted exception, instead of
-                    ;; covering it up with a failed cancel
-                    (catch Exception e
-                      (log/error e (str "Error cancelling query with id " id))))
-                  (log/warn "Client connection closed, no query-id found, can't cancel query"))
-                ;; Propogate the error so that any finalizers can still run
-                (throw e)))))))))
+                (try
+                  (if id
+                    ;; If we have a query id, we can cancel the query
+                    (try
+                      (let [tunneledUri (details->uri details-with-tunnel (str "/v1/query/" id))
+                            adjustedUri (create-cancel-url tunneledUri (get details :host) (get details :port) infoUri)]
+                        (http/delete adjustedUri (details->request details-with-tunnel)))
+                      ;; If we fail to cancel the query, log it but propogate the interrupted exception, instead of
+                      ;; covering it up with a failed cancel
+                      (catch Exception e
+                        (log/error e (trs "Error canceling query with ID {0}" id))))
+                    (log/warn (trs "Client connection closed, no query-id found, can't cancel query")))
+                  (finally
+                    ;; Propagate the error so that any finalizers can still run
+                    (throw e)))))))))))
 
 
-;;; Generic helpers
+;;; `:sql` driver implementation
 
-(defn- quote-name [s]
-  {:pre [(string? s)]}
-  (str \" (str/replace s "\"" "\"\"") \"))
-
-(defn- quote+combine-names [& names]
-  (str/join \. (map quote-name names)))
-
-;;; IDriver implementation
-
-(s/defmethod driver/can-connect? :presto [_ {:keys [catalog] :as details} :- PrestoConnectionDetails]
-  (let [{[[v]] :rows} (execute-presto-query! details (str "SHOW SCHEMAS FROM " (quote-name catalog)
-                                                          " LIKE 'information_schema'"))]
+(s/defmethod driver/can-connect? :presto
+  [driver {:keys [catalog] :as details} :- PrestoConnectionDetails]
+  (let [{[[v]] :rows} (execute-presto-query! details
+                        (format "SHOW SCHEMAS FROM %s LIKE 'information_schema'" (sql.u/quote-name driver :database catalog)))]
     (= v "information_schema")))
 
-(defmethod driver/date-interval :presto [_ unit amount]
-  (hsql/call :date_add (hx/literal unit) amount :%now))
+(defmethod driver/date-add :presto
+  [_ dt amount unit]
+  (hsql/call :date_add (hx/literal unit) amount dt))
 
 (s/defn ^:private database->all-schemas :- #{su/NonBlankString}
   "Return a set of all schema names in this `database`."
-  [{{:keys [catalog schema] :as details} :details :as database}]
-  (let [sql            (str "SHOW SCHEMAS FROM " (quote-name catalog))
+  [driver {{:keys [catalog schema] :as details} :details :as database}]
+  (let [sql            (str "SHOW SCHEMAS FROM " (sql.u/quote-name driver :database catalog))
         {:keys [rows]} (execute-presto-query! details sql)]
     (set (map first rows))))
 
-(defn- describe-schema [{{:keys [catalog] :as details} :details} {:keys [schema]}]
-  (let [sql            (str "SHOW TABLES FROM " (quote+combine-names catalog schema))
+(defn- describe-schema [driver {{:keys [catalog] :as details} :details} {:keys [schema]}]
+  (let [sql            (str "SHOW TABLES FROM " (sql.u/quote-name driver :schema catalog schema))
         {:keys [rows]} (execute-presto-query! details sql)
         tables         (map first rows)]
     (set (for [table-name tables]
@@ -180,10 +159,11 @@
 
 (def ^:private excluded-schemas #{"information_schema"})
 
-(defmethod driver/describe-database :presto [driver database]
-  (let [schemas (remove excluded-schemas (database->all-schemas database))]
+(defmethod driver/describe-database :presto
+  [driver database]
+  (let [schemas (remove excluded-schemas (database->all-schemas driver database))]
     {:tables (reduce set/union (for [schema schemas]
-                                 (describe-schema database {:schema schema})))}))
+                                 (describe-schema driver database {:schema schema})))}))
 
 (defn- presto-type->base-type [field-type]
   (condp re-matches field-type
@@ -207,8 +187,9 @@
     #"row.*"       :type/*          ; TODO - again, but this time we supposedly have a schema
     #".*"          :type/*))
 
-(defmethod driver/describe-table :presto [_ {{:keys [catalog] :as details} :details} {schema :schema, table-name :name}]
-  (let [sql            (str "DESCRIBE " (quote+combine-names catalog schema table-name))
+(defmethod driver/describe-table :presto
+  [driver {{:keys [catalog] :as details} :details} {schema :schema, table-name :name}]
+  (let [sql            (str "DESCRIBE " (sql.u/quote-name driver :table catalog schema table-name))
         {:keys [rows]} (execute-presto-query! details sql)]
     {:schema schema
      :name   table-name
@@ -225,42 +206,45 @@
   [_ bool]
   (hsql/raw (if bool "TRUE" "FALSE")))
 
-(defmethod sql.qp/->honeysql [:presto Date]
-  [_ date]
-  (hsql/call :from_iso8601_timestamp (hx/literal (du/date->iso-8601 date))))
-
 (defmethod sql.qp/->honeysql [:presto :stddev]
   [driver [_ field]]
   (hsql/call :stddev_samp (sql.qp/->honeysql driver field)))
 
-(def ^:private time-format (tformat/formatter "HH:mm:SS.SSS"))
-
-(defn- time->str
-  ([t]
-   (time->str t nil))
-  ([t tz-id]
-   (let [tz (time/time-zone-for-id tz-id)]
-     (tformat/unparse (tformat/with-zone time-format tz) (tcoerce/to-date-time t)))))
-
 (defmethod sql.qp/->honeysql [:presto :time]
-  [_ [_ value]]
-  (hx/cast :time (time->str value (driver/report-timezone))))
+  [_ [_ t]]
+  (hx/cast :time (u.date/format-sql (t/local-time t))))
 
-(defmethod driver/execute-query :presto [_ {database-id                  :database
-                                            :keys                        [settings]
-                                            {sql :query, params :params} :native
-                                            query-type                   :type
-                                            :as                          outer-query}]
+;; See https://prestodb.io/docs/current/functions/datetime.html
+
+;; This is only needed for test purposes, because some of the sample data still uses legacy types
+(defmethod unprepare/unprepare-value [:presto Time]
+  [driver t]
+  (unprepare/unprepare-value driver (t/local-time t)))
+
+(defmethod unprepare/unprepare-value [:presto OffsetDateTime]
+  [_ t]
+  (format "timestamp '%s %s %s'" (t/local-date t) (t/local-time t) (t/zone-offset t)))
+
+(defmethod unprepare/unprepare-value [:presto ZonedDateTime]
+  [_ t]
+  (format "timestamp '%s %s %s'" (t/local-date t) (t/local-time t) (t/zone-id t)))
+
+(defmethod driver/execute-query :presto
+  [driver {database-id                  :database
+           :keys                        [settings]
+           {sql :query, params :params} :native
+           query-type                   :type
+           :as                          outer-query}]
   (let [sql                    (str "-- "
                                     (qputil/query->remark outer-query) "\n"
-                                    (unprepare/unprepare (cons sql params) :quote-escape "'", :iso-8601-fn :from_iso8601_timestamp))
+                                    (unprepare/unprepare driver (cons sql params)))
         details                (merge (:details (qp.store/database))
                                       settings)
         {:keys [columns rows]} (execute-presto-query! details sql)
         columns                (for [[col name] (map vector columns (map :name columns))]
                                  {:name name, :base_type (presto-type->base-type (:type col))})]
     (merge
-     {:columns (map (comp u/keyword->qualified-name :name) columns)
+     {:columns (map (comp u/qualified-name :name) columns)
       :rows    rows}
      ;; only include `:cols` info for native queries for the time being, since it changes all the types up for MBQL
      ;; queries (e.g. `:count` aggregations come back as `:type/BigInteger` instead of `:type/Integer`.) I don't want
@@ -269,8 +253,8 @@
      (when (= query-type :native)
        {:cols columns}))))
 
-
-(defmethod driver/humanize-connection-error-message :presto [_ message]
+(defmethod driver/humanize-connection-error-message :presto
+  [_ message]
   (condp re-matches message
     #"^java.net.ConnectException: Connection refused.*$"
     (driver.common/connection-error-messages :cannot-connect-check-host-and-port)
@@ -284,10 +268,10 @@
     #".*" ; default
     message))
 
+;;; `:sql-driver` methods
 
-;;; ISQLDriver implementation
-
-(defmethod sql.qp/apply-top-level-clause [:presto :page] [_ _ honeysql-query {{:keys [items page]} :page}]
+(defmethod sql.qp/apply-top-level-clause [:presto :page]
+  [_ _ honeysql-query {{:keys [items page]} :page}]
   (let [offset (* (dec page) items)]
     (if (zero? offset)
       ;; if there's no offset we can simply use limit
@@ -314,25 +298,26 @@
 (defmethod sql.qp/date [:presto :day-of-year]     [_ _ expr] (hsql/call :day_of_year expr))
 
 ;; Similar to DoW, sicne Presto is ISO compliant the week starts on Monday, we need to shift that to Sunday
-(defmethod sql.qp/date [:presto :week]            [_ _ expr]
+(defmethod sql.qp/date [:presto :week]
+  [_ _ expr]
   (hsql/call :date_add
     (hx/literal :day) -1 (hsql/call :date_trunc
                            (hx/literal :week) (hsql/call :date_add
                                                 (hx/literal :day) 1 expr))))
 
 ;; Offset by one day forward to "fake" a Sunday starting week
-(defmethod sql.qp/date [:presto :week-of-year]    [_ _ expr]
+(defmethod sql.qp/date [:presto :week-of-year]
+  [_ _ expr]
   (hsql/call :week (hsql/call :date_add (hx/literal :day) 1 expr)))
 
 (defmethod sql.qp/date [:presto :month]           [_ _ expr] (hsql/call :date_trunc (hx/literal :month) expr))
 (defmethod sql.qp/date [:presto :month-of-year]   [_ _ expr] (hsql/call :month expr))
 (defmethod sql.qp/date [:presto :quarter]         [_ _ expr] (hsql/call :date_trunc (hx/literal :quarter) expr))
 (defmethod sql.qp/date [:presto :quarter-of-year] [_ _ expr] (hsql/call :quarter expr))
-(defmethod sql.qp/date [:presto :year]            [_ _ expr] (hsql/call :year expr))
+(defmethod sql.qp/date [:presto :year]            [_ _ expr] (hsql/call :date_trunc (hx/literal :year) expr))
 
 (defmethod sql.qp/unix-timestamp->timestamp [:presto :seconds] [_ _ expr]
   (hsql/call :from_unixtime expr))
-
 
 (defmethod driver.common/current-db-time-date-formatters :presto [_]
   (driver.common/create-db-time-formatters "yyyy-MM-dd'T'HH:mm:ss.SSSZ"))
@@ -351,5 +336,4 @@
 (defmethod driver/supports? [:presto :expression-aggregations]         [_ _] true)
 (defmethod driver/supports? [:presto :binning]                         [_ _] true)
 
-;; during unit tests don't treat presto as having FK support
-(defmethod driver/supports? [:presto :foreign-keys] [_ _] (not config/is-test?))
+(defmethod driver/supports? [:presto :foreign-keys] [_ _] true)

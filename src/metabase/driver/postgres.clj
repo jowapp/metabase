@@ -2,10 +2,12 @@
   "Database driver for PostgreSQL databases. Builds on top of the SQL JDBC driver, which implements most functionality
   for JDBC-based drivers."
   (:require [clojure
-             [set :as set :refer [rename-keys]]
-             [string :as s]]
+             [set :as set]
+             [string :as str]]
             [clojure.java.jdbc :as jdbc]
+            [clojure.tools.logging :as log]
             [honeysql.core :as hsql]
+            [java-time :as t]
             [metabase.db.spec :as db.spec]
             [metabase.driver :as driver]
             [metabase.driver.common :as driver.common]
@@ -15,11 +17,14 @@
              [execute :as sql-jdbc.execute]
              [sync :as sql-jdbc.sync]]
             [metabase.driver.sql.query-processor :as sql.qp]
+            [metabase.driver.sql.util.unprepare :as unprepare]
             [metabase.util
+             [date-2 :as u.date]
              [honeysql-extensions :as hx]
              [ssh :as ssh]])
-  (:import java.sql.Time
-           java.util.UUID))
+  (:import [java.sql ResultSet ResultSetMetaData Time Types]
+           [java.time LocalDateTime OffsetDateTime OffsetTime]
+           [java.util Date UUID]))
 
 (driver/register! :postgres, :parent :sql-jdbc)
 
@@ -29,11 +34,13 @@
 
 (defmethod driver/display-name :postgres [_] "PostgreSQL")
 
+(defmethod driver/date-add :postgres
+  [_ dt amount unit]
+  (hx/+ (hx/->timestamp dt)
+        (hsql/raw (format "(INTERVAL '%d %s')" (int amount) (name unit)))))
 
-(defmethod driver/date-interval :postgres [_ unit amount]
-  (hsql/raw (format "(NOW() + INTERVAL '%d %s')" (int amount) (name unit))))
-
-(defmethod driver/humanize-connection-error-message :postgres [_ message]
+(defmethod driver/humanize-connection-error-message :postgres
+  [_ message]
   (condp re-matches message
     #"^FATAL: database \".*\" does not exist$"
     (driver.common/connection-error-messages :database-name-incorrect)
@@ -52,22 +59,25 @@
 
     #"^FATAL: .*$" ; all other FATAL messages: strip off the 'FATAL' part, capitalize, and add a period
     (let [[_ message] (re-matches #"^FATAL: (.*$)" message)]
-      (str (s/capitalize message) \.))
+      (str (str/capitalize message) \.))
 
     #".*" ; default
     message))
 
-(defmethod driver.common/current-db-time-date-formatters :postgres [_]
+(defmethod driver.common/current-db-time-date-formatters :postgres
+  [_]
   (driver.common/create-db-time-formatters "yyyy-MM-dd HH:mm:ss.SSS zzz"))
 
-(defmethod driver.common/current-db-time-native-query :postgres [_]
+(defmethod driver.common/current-db-time-native-query :postgres
+  [_]
   "select to_char(current_timestamp, 'YYYY-MM-DD HH24:MI:SS.MS TZ')")
 
-(defmethod driver/current-db-time :postgres [& args]
+(defmethod driver/current-db-time :postgres
+  [& args]
   (apply driver.common/current-db-time args))
 
-
-(defmethod driver/connection-properties :postgres [_]
+(defmethod driver/connection-properties :postgres
+  [_]
   (ssh/with-tunnel-config
     [driver.common/default-host-details
      (assoc driver.common/default-port-details :default 5432)
@@ -77,7 +87,6 @@
      driver.common/default-ssl-details
      (assoc driver.common/default-additional-options-details
        :placeholder "prepareThreshold=0")]))
-
 
 (defn- enum-types [driver database]
   (set
@@ -93,7 +102,8 @@
 ;; Describe the Fields present in a `table`. This just hands off to the normal SQL driver implementation of the same
 ;; name, but first fetches database enum types so we have access to them. These are simply binded to the dynamic var
 ;; and used later in `database-type->base-type`, which you will find below.
-(defmethod driver/describe-table :postgres [driver database table]
+(defmethod driver/describe-table :postgres
+  [driver database table]
   (binding [*enum-types* (enum-types driver database)]
     (sql-jdbc.sync/describe-table driver database table)))
 
@@ -111,7 +121,7 @@
 
 (def ^:private extract-integer (comp hx/->integer extract))
 
-(def ^:private ^:const one-day (hsql/raw "INTERVAL '1 day'"))
+(def ^:private one-day (hsql/raw "INTERVAL '1 day'"))
 
 (defmethod sql.qp/date [:postgres :default]        [_ _ expr] expr)
 (defmethod sql.qp/date [:postgres :minute]         [_ _ expr] (date-trunc :minute expr))
@@ -133,10 +143,11 @@
 (defmethod sql.qp/date [:postgres :month-of-year]   [_ _ expr] (extract-integer :month expr))
 (defmethod sql.qp/date [:postgres :quarter]         [_ _ expr] (date-trunc :quarter expr))
 (defmethod sql.qp/date [:postgres :quarter-of-year] [_ _ expr] (extract-integer :quarter expr))
-(defmethod sql.qp/date [:postgres :year]            [_ _ expr] (extract-integer :year expr))
+(defmethod sql.qp/date [:postgres :year]            [_ _ expr] (date-trunc :year expr))
 
 
-(defmethod sql.qp/->honeysql [:postgres :value] [driver value]
+(defmethod sql.qp/->honeysql [:postgres :value]
+  [driver value]
   (let [[_ value {base-type :base_type, database-type :database_type}] value]
     (when (some? value)
       (cond
@@ -148,6 +159,16 @@
 (defmethod sql.qp/->honeysql [:postgres Time]
   [_ time-value]
   (hx/->time time-value))
+
+(defmethod unprepare/unprepare-value [:postgres Date]
+  [_ value]
+  (format "'%s'::timestamp" (u.date/format value)))
+
+(prefer-method unprepare/unprepare-value [:sql Time] [:postgres Date])
+
+(defmethod unprepare/unprepare-value [:postgres UUID]
+  [_ value]
+  (format "'%s'::uuid" value))
 
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -198,9 +219,9 @@
    :smallserial   :type/Integer
    :text          :type/Text
    :time          :type/Time
-   :timetz        :type/Time
+   :timetz        :type/TimeWithLocalTZ
    :timestamp     :type/DateTime
-   :timestamptz   :type/DateTime
+   :timestamptz   :type/DateTimeWithLocalTZ
    :tsquery       :type/*
    :tsvector      :type/*
    :txid_snapshot :type/*
@@ -216,29 +237,32 @@
    (keyword "timestamp with timezone")    :type/DateTime
    (keyword "timestamp without timezone") :type/DateTime})
 
-(defmethod sql-jdbc.sync/database-type->base-type :postgres [driver column]
+(defmethod sql-jdbc.sync/database-type->base-type :postgres
+  [driver column]
   (if (contains? *enum-types* column)
     :type/PostgresEnum
     (default-base-types column)))
 
-(defmethod sql-jdbc.sync/column->special-type :postgres [_ database-type _]
+(defmethod sql-jdbc.sync/column->special-type :postgres
+  [_ database-type _]
   ;; this is really, really simple right now.  if its postgres :json type then it's :type/SerializedJSON special-type
   (case database-type
     "json" :type/SerializedJSON
     "inet" :type/IPAddress
     nil))
 
-(def ^:private ^:const ssl-params
+(def ^:private ssl-params
   "Params to include in the JDBC connection spec for an SSL connection."
   {:ssl        true
    :sslmode    "require"
-   :sslfactory "org.postgresql.ssl.NonValidatingFactory"})  ; HACK Why enable SSL if we disable certificate validation?
+   :sslfactory "org.postgresql.ssl.NonValidatingFactory"})
 
-(def ^:private ^:const disable-ssl-params
+(def ^:private disable-ssl-params
   "Params to include in the JDBC connection spec to disable SSL."
   {:sslmode "disable"})
 
-(defmethod sql-jdbc.conn/connection-details->spec :postgres [_ {ssl? :ssl, :as details-map}]
+(defmethod sql-jdbc.conn/connection-details->spec :postgres
+  [_ {ssl? :ssl, :as details-map}]
   (-> details-map
       (update :port (fn [port]
                       (if (string? port)
@@ -249,10 +273,37 @@
       (merge (if ssl?
                ssl-params
                disable-ssl-params))
-      (rename-keys {:dbname :db})
+      (set/rename-keys {:dbname :db})
       db.spec/postgres
       (sql-jdbc.common/handle-additional-options details-map)))
 
-
-(defmethod sql-jdbc.execute/set-timezone-sql :postgres [_]
+(defmethod sql-jdbc.execute/set-timezone-sql :postgres
+  [_]
   "SET SESSION TIMEZONE TO %s;")
+
+;; for some reason postgres `TIMESTAMP WITH TIME ZONE` columns still come back as `Type/TIMESTAMP`, which seems like a
+;; bug with the JDBC driver?
+(defmethod sql-jdbc.execute/read-column [:postgres Types/TIMESTAMP]
+  [_ _ ^ResultSet rs ^ResultSetMetaData rsmeta ^Integer i]
+  (let [^Class klass (if (= (str/lower-case (.getColumnTypeName rsmeta i)) "timestamptz")
+                       OffsetDateTime
+                       LocalDateTime)]
+    (.getObject rs i klass)))
+
+;; Sometimes Postgres times come back as strings like `07:23:18.331+00` (no minute in offset) and there's a bug in the
+;; JDBC driver where it can't parse those correctly. We can do it ourselves in that case.
+(defmethod sql-jdbc.execute/read-column [:postgres Types/TIME]
+  [driver _ ^ResultSet rs rsmeta ^Integer i]
+  (let [parent-method (get-method sql-jdbc.execute/read-column [:sql-jdbc Types/TIME])]
+    (try
+      (parent-method driver nil rs rsmeta i)
+      (catch Throwable _
+        (let [s (.getString rs i)]
+          (log/tracef "Error in Postgres JDBC driver reading TIME value, fetching as string '%s'" s)
+          (u.date/parse s))))))
+
+;; Postgres doesn't support OffsetTime
+(defmethod sql-jdbc.execute/set-parameter [:postgres OffsetTime]
+  [driver prepared-statement i t]
+  (let [local-time (t/local-time (t/with-offset-same-instant t (t/zone-offset 0)))]
+    (sql-jdbc.execute/set-parameter driver prepared-statement i local-time)))

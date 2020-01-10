@@ -1,6 +1,6 @@
 /* @flow */
 
-import { t } from "c-3po";
+import { t } from "ttag";
 import moment from "moment";
 import _ from "underscore";
 
@@ -26,7 +26,6 @@ import {
   numberFormatterForOptions,
 } from "metabase/lib/formatting";
 import {
-  DEFAULT_DATE_STYLE,
   getDateFormatFromStyle,
   hasDay,
   hasHour,
@@ -58,7 +57,7 @@ type ColumnSettingDef = SettingDef & {
 export function columnSettings({
   getColumns = DEFAULT_GET_COLUMNS,
   ...def
-}: ColumnSettingDef) {
+}: ColumnSettingDef = {}) {
   return nestedSettings("column_settings", {
     section: t`Formatting`,
     objectName: "column",
@@ -76,7 +75,7 @@ import MetabaseSettings from "metabase/lib/settings";
 import { isa } from "metabase/lib/types";
 
 export function getGlobalSettingsForColumn(column: Column) {
-  let settings = {};
+  const settings = {};
 
   const customFormatting = MetabaseSettings.get("custom-formatting");
   // NOTE: the order of these doesn't matter as long as there's no overlap between settings
@@ -108,6 +107,13 @@ function getDateStyleOptionsForUnit(
   abbreviate?: boolean = false,
   separator?: string,
 ) {
+  // hour-of-day shouldn't have any date style. It's handled as a time instead.
+  // Other date parts are handled as dates, but hour-of-day needs to use the
+  // time settings for 12/24 hour clock.
+  if (unit === "hour-of-day") {
+    return [];
+  }
+
   const options = [
     dateStyleOption("MMMM D, YYYY", unit, null, abbreviate, separator),
     dateStyleOption("D MMMM, YYYY", unit, null, abbreviate, separator),
@@ -177,7 +183,12 @@ export const DATE_COLUMN_SETTINGS = {
   date_style: {
     title: t`Date style`,
     widget: "select",
-    default: DEFAULT_DATE_STYLE,
+    getDefault: ({ unit }: Column) => {
+      // Grab the first option's value. If there were no options (for
+      // hour-of-day probably), use an empty format string instead.
+      const [{ value = "" } = {}] = getDateStyleOptionsForUnit(unit);
+      return value;
+    },
     isValid: ({ unit }: Column, settings: ColumnSettings) => {
       const options = getDateStyleOptionsForUnit(unit);
       return !!_.findWhere(options, { value: settings["date_style"] });
@@ -257,6 +268,9 @@ export const DATE_COLUMN_SETTINGS = {
     getProps: (column: Column, settings: ColumnSettings) => ({
       options: [
         timeStyleOption("h:mm A", "12-hour clock"),
+        ...(column.unit === "hour-of-day"
+          ? [timeStyleOption("h A", "12-hour clock without minutes")]
+          : []),
         timeStyleOption("k:mm", "24-hour clock"),
       ],
     }),
@@ -294,6 +308,7 @@ export const NUMBER_COLUMN_SETTINGS = {
     // hide this for currency
     getHidden: (column: Column, settings: ColumnSettings) =>
       isCurrency(column) && settings["number_style"] === "currency",
+    readDependencies: ["currency"],
   },
   currency: {
     title: t`Unit of currency`,
@@ -312,8 +327,8 @@ export const NUMBER_COLUMN_SETTINGS = {
     },
     default: "USD",
     getHidden: (column: Column, settings: ColumnSettings) =>
-      settings["number_style"] !== "currency",
-    readDependencies: ["number_style"],
+      // NOTE: ideally we'd hide this if number_style != "currency" but that would result in a circular dependency
+      !isCurrency(column),
   },
   currency_style: {
     title: t`Currency label style`,
@@ -441,11 +456,11 @@ const COMMON_COLUMN_SETTINGS = {
 };
 
 export function getSettingDefintionsForColumn(series: Series, column: Column) {
-  const { CardVisualization } = getVisualizationRaw(series);
+  const { visualization } = getVisualizationRaw(series);
   const extraColumnSettings =
-    typeof CardVisualization.columnSettings === "function"
-      ? CardVisualization.columnSettings(column)
-      : CardVisualization.columnSettings || {};
+    typeof visualization.columnSettings === "function"
+      ? visualization.columnSettings(column)
+      : visualization.columnSettings || {};
 
   if (isDate(column)) {
     return {

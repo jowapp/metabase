@@ -13,7 +13,6 @@
             [metabase.driver.common :as driver.common]
             [metabase.plugins.init-steps :as init-steps]
             [metabase.util
-             [date :as du]
              [i18n :refer [trs]]
              [ssh :as ssh]])
   (:import clojure.lang.MultiFn))
@@ -22,10 +21,10 @@
   (cond
     (string? prop)
     (or (driver.common/default-options (keyword prop))
-        (throw (Exception. (str (trs "Default connection property {0} does not exist." prop)))))
+        (throw (Exception. (trs "Default connection property {0} does not exist." prop))))
 
     (not (map? prop))
-    (throw (Exception. (str (trs "Invalid connection property {0}: not a string or map." prop))))
+    (throw (Exception. (trs "Invalid connection property {0}: not a string or map." prop)))
 
     (:merge prop)
     (reduce merge (map parse-connection-property (:merge prop)))
@@ -44,15 +43,18 @@
     connection-properties-include-tunnel-config
     ssh/with-tunnel-config))
 
-(defn- make-initialize! [driver init-steps]
+(defn- make-initialize! [driver add-to-classpath! init-steps]
   (fn [_]
+    ;; First things first: add the driver to the classpath!
+    (when add-to-classpath!
+      (add-to-classpath!))
     ;; remove *this* implementation of `initialize!`, because as you will see below, we want to give
     ;; lazy-load drivers the option to implement `initialize!` and do other things, which means we need to
     ;; manually call it. When we do so we don't want to get stuck in an infinite loop of calls back to this
     ;; implementation
     (remove-method driver/initialize! driver)
     ;; ok, do the init steps listed in the plugin mainfest
-    (du/profile (u/format-color 'magenta (trs "Load lazy loading driver {0}" driver))
+    (u/profile (u/format-color 'magenta (trs "Load lazy loading driver {0}" driver))
       (init-steps/do-init-steps! init-steps))
     ;; ok, now go ahead and call `driver/initialize!` a second time on the driver in case it actually has
     ;; an implementation of `initialize!` other than this one. If it does not, we'll just end up hitting
@@ -61,14 +63,15 @@
 
 (defn register-lazy-loaded-driver!
   "Register a basic shell of a Metabase driver using the information from its Metabase plugin"
-  [{init-steps                                                                                      :init
+  [{:keys                                                                                            [add-to-classpath!]
+    init-steps                                                                                       :init
     {driver-name :name, :keys [abstract display-name parent], :or {abstract false}, :as driver-info} :driver}]
   {:pre [(map? driver-info)]}
   (let [driver           (keyword driver-name)
         connection-props (parse-connection-properties driver-info)]
     ;; Make sure the driver has required properties like driver-name
     (when-not (seq driver-name)
-      (throw (ex-info (str (trs "Cannot initialize plugin: missing required property `driver-name`"))
+      (throw (ex-info (trs "Cannot initialize plugin: missing required property `driver-name`")
                driver-info)))
     ;; if someone forgot to include connection properties for a non-abstract driver throw them a bone and warn them
     ;; about it
@@ -78,12 +81,11 @@
        (u/format-color 'red (trs "Warning: plugin manifest for {0} does not include connection properties" driver))))
     ;; ok, now add implementations for the so-called "non-trivial" driver multimethods
     (doseq [[^MultiFn multifn, f]
-            {driver/initialize!           (make-initialize! driver init-steps)
-             driver/available?            (constantly (not abstract))
+            {driver/initialize!           (make-initialize! driver add-to-classpath! init-steps)
              driver/display-name          (when display-name (constantly display-name))
              driver/connection-properties (constantly connection-props)}]
       (when f
         (.addMethod multifn driver f)))
     ;; finally, register the Metabase driver
-    (log/info (u/format-color 'magenta (trs "Registering lazy loading driver {0}..." driver)))
+    (log/debug (u/format-color 'magenta (trs "Registering lazy loading driver {0}..." driver)))
     (driver/register! driver, :parent (set (map keyword (u/one-or-many parent))), :abstract? abstract)))

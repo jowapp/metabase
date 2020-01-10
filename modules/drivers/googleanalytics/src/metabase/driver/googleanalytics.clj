@@ -1,6 +1,6 @@
 (ns metabase.driver.googleanalytics
   (:require [cheshire.core :as json]
-            [clojure.string :as s]
+            [clojure.string :as str]
             [metabase
              [driver :as driver]
              [util :as u]]
@@ -14,6 +14,9 @@
            [java.util Collections Date Map]))
 
 (driver/register! :googleanalytics, :parent :google)
+
+(defmethod driver/supports? [:googleanalytics :basic-aggregations] [_ _] false)
+
 
 ;;; ----------------------------------------------------- Client -----------------------------------------------------
 
@@ -85,7 +88,7 @@
   (google/execute (.list (.columns (.metadata client)) "ga")))
 
 (defn- column-attribute
-  "Get the value of ATTRIBUTE-NAME for COLUMN."
+  "Get the value of `attribute-name` for `column`."
   [^Column column, attribute-name]
   (get (.getAttributes column) (name attribute-name)))
 
@@ -128,8 +131,8 @@
 (defn- property+profile->display-name
   "Format a table name for a GA property and GA profile"
   [^Webproperty property, ^Profile profile]
-  (let [property-name (s/replace (.getName property) #"^https?://" "")
-        profile-name  (s/replace (.getName profile)  #"^https?://" "")]
+  (let [property-name (str/replace (.getName property) #"^https?://" "")
+        profile-name  (str/replace (.getName profile)  #"^https?://" "")]
     ;; don't include the profile if it's the same as property-name or is the default "All Web Site Data"
     (if (or (.contains property-name profile-name)
             (= profile-name "All Web Site Data"))
@@ -191,7 +194,8 @@
 (defn- add-built-in-column-metadata [query results]
   (update-in results [:data :cols] (partial map (partial add-col-metadata query))))
 
-(defmethod driver/process-query-in-context :googleanalytics [_ qp]
+(defmethod driver/process-query-in-context :googleanalytics
+  [_ qp]
   (fn [query]
     (let [results (qp query)]
       (add-built-in-column-metadata query results))))
@@ -201,18 +205,19 @@
                  (json/parse-string query keyword)
                  query)
         client (database->client database)]
+    ;; `end-date` is inclusive!!!
     (u/prog1 (.get (.ga (.data client))
                    (:ids query)
                    (:start-date query)
                    (:end-date query)
                    (:metrics query))
-      (when-not (s/blank? (:dimensions query))
+      (when-not (str/blank? (:dimensions query))
         (.setDimensions <> (:dimensions query)))
-      (when-not (s/blank? (:sort query))
+      (when-not (str/blank? (:sort query))
         (.setSort <> (:sort query)))
-      (when-not (s/blank? (:filters query))
+      (when-not (str/blank? (:filters query))
         (.setFilters <> (:filters query)))
-      (when-not (s/blank? (:segment query))
+      (when-not (str/blank? (:segment query))
         (.setSegment <> (:segment query)))
       (when-not (nil? (:max-results query))
         (.setMaxResults <> (:max-results query)))
@@ -226,8 +231,8 @@
   ;; if we get a big long message about how we need to enable the GA API, then replace it with a short message about
   ;; how we need to enable the API
   (if-let [[_ enable-api-url] (re-find #"Enable it by visiting ([^\s]+) then retry." message)]
-    (str (tru "You must enable the Google Analytics API. Use this link to go to the Google Developers Console: {0}"
-              enable-api-url))
+    (tru "You must enable the Google Analytics API. Use this link to go to the Google Developers Console: {0}"
+         enable-api-url)
     message))
 
 (defmethod driver/mbql->native :googleanalytics [_ query]

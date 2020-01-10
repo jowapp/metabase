@@ -1,6 +1,7 @@
 /* @flow weak */
 
-import "babel-polyfill";
+import "core-js/stable";
+import "regenerator-runtime/runtime";
 
 // Use of classList.add and .remove in Background and FitViewPort Hocs requires
 // this polyfill so that those work in older browsers
@@ -82,14 +83,15 @@ function _init(reducers, getRoutes, callback) {
   store.dispatch(refreshSiteSettings());
 
   // enable / disable GA based on opt-out of anonymous tracking
-  MetabaseSettings.on("anon_tracking_enabled", () => {
+  MetabaseSettings.on("anon-tracking-enabled", () => {
     window[
-      "ga-disable-" + MetabaseSettings.get("ga_code")
+      "ga-disable-" + MetabaseSettings.get("ga-code")
     ] = MetabaseSettings.isTrackingEnabled() ? null : true;
   });
 
   window.Metabase = window.Metabase || {};
   window.Metabase.store = store;
+  window.Metabase.settings = MetabaseSettings;
 
   if (callback) {
     callback(store);
@@ -97,7 +99,7 @@ function _init(reducers, getRoutes, callback) {
 }
 
 export function init(...args) {
-  if (document.readyState != "loading") {
+  if (document.readyState !== "loading") {
     _init(...args);
   } else {
     document.addEventListener("DOMContentLoaded", () => _init(...args));
